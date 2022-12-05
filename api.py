@@ -5,6 +5,7 @@ from flask_cors import CORS
 from sd import *
 
 sd = SD()
+sd2 = SD(v=2)
 app = Flask(__name__)
 CORS(app)
 
@@ -17,7 +18,10 @@ def img(prompt):
   seed = int(args.get('seed'))
   neg_prompt = args.get('neg_prompt', default="")
 
-  image = sd.generate(prompt, steps=steps, cfg=cfg, seed=seed, neg_prompt=neg_prompt)
+  if args.get('v2', default=None) is None:
+    image = sd.generate(prompt, steps=steps, cfg=cfg, seed=seed, neg_prompt=neg_prompt)
+  else:
+    image = sd2.generate(prompt, steps=steps, cfg=cfg, seed=seed, neg_prompt=neg_prompt)
 
   image.save("output.png")
   return send_file('./output.png')
@@ -32,7 +36,11 @@ def combine():
   seed = request.json['seed'] if 'seed' in request.json else None
   neg_prompt = request.json['neg_prompt'] if 'neg_prompt' in request.json else ""
 
-  image = sd.generateFromWeightedTextEmbeddings([(p, w) for (p, w) in zip(ps, ws)], neg_prompt=neg_prompt, seed=seed, cfg=cfg, steps=steps)
+  if 'v2' in request.json:
+    image = sd2.generateFromWeightedTextEmbeddings([(p, w) for (p, w) in zip(ps, ws)], neg_prompt=neg_prompt, seed=seed, cfg=cfg, steps=steps)
+  else:
+    image = sd.generateFromWeightedTextEmbeddings([(p, w) for (p, w) in zip(ps, ws)], neg_prompt=neg_prompt, seed=seed, cfg=cfg, steps=steps)
+    
 
   image.save("output.png")
   return send_file('./output.png')

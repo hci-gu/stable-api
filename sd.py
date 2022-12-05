@@ -8,13 +8,19 @@ import os
 huggingface_token = os.environ.get('HUGGINGFACE_TOKEN')
 
 class SD:
-  def __init__(self):
+  def __init__(self, v=1):
 #    pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", torch_dtype=torch.float16, revision="fp16")
 #    pipe = pipe.to("cuda")
-    self.vae = AutoencoderKL.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="vae", use_auth_token=huggingface_token)
-    self.tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
-    self.text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14")
-    self.unet = UNet2DConditionModel.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="unet", use_auth_token=huggingface_token)
+    if v == 2:
+      self.vae = AutoencoderKL.from_pretrained("stabilityai/stable-diffusion-2-base", subfolder="vae", use_auth_token=huggingface_token)
+      self.tokenizer = CLIPTokenizer.from_pretrained("stabilityai/stable-diffusion-2-base", subfolder="tokenizer", use_auth_token=huggingface_token)
+      self.text_encoder = CLIPTextModel.from_pretrained("stabilityai/stable-diffusion-2-base", subfolder="text_encoder", use_auth_token=huggingface_token)
+      self.unet = UNet2DConditionModel.from_pretrained("stabilityai/stable-diffusion-2-base", subfolder="unet", use_auth_token=huggingface_token)
+    else:
+      self.vae = AutoencoderKL.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="vae", use_auth_token=huggingface_token)
+      self.tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
+      self.text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14")
+      self.unet = UNet2DConditionModel.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="unet", use_auth_token=huggingface_token)
     self.scheduler = LMSDiscreteScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000)
     self.device = "cuda"
     self.vae.to(self.device)
