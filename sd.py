@@ -1,107 +1,146 @@
 import torch
-from transformers import CLIPTextModel, CLIPTokenizer
-from diffusers import AutoencoderKL, UNet2DConditionModel, LMSDiscreteScheduler
-from tqdm.auto import tqdm
-from PIL import Image
 import os
+import xformers
+import time
+from diffusers import DiffusionPipeline, AutoencoderTiny
+from compel import Compel, ReturnedEmbeddingsType
+from sfast.compilers.stable_diffusion_pipeline_compiler import (compile, CompilationConfig)
+
+torch.set_grad_enabled(False)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 huggingface_token = os.environ.get('HUGGINGFACE_TOKEN')
 
 class SD:
-  def __init__(self, v=1):
-#    pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", torch_dtype=torch.float16, revision="fp16")
-#    pipe = pipe.to("cuda")
-    if v == 2:
-      self.vae = AutoencoderKL.from_pretrained("stabilityai/stable-diffusion-2-base", subfolder="vae", use_auth_token=huggingface_token)
-      self.tokenizer = CLIPTokenizer.from_pretrained("stabilityai/stable-diffusion-2-base", subfolder="tokenizer", use_auth_token=huggingface_token)
-      self.text_encoder = CLIPTextModel.from_pretrained("stabilityai/stable-diffusion-2-base", subfolder="text_encoder", use_auth_token=huggingface_token)
-      self.unet = UNet2DConditionModel.from_pretrained("stabilityai/stable-diffusion-2-base", subfolder="unet", use_auth_token=huggingface_token)
-    else:
-      self.vae = AutoencoderKL.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="vae", use_auth_token=huggingface_token)
-      self.tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
-      self.text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14")
-      self.unet = UNet2DConditionModel.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="unet", use_auth_token=huggingface_token)
-    self.scheduler = LMSDiscreteScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000)
-    self.device = "cuda"
-    self.vae.to(self.device)
-    self.text_encoder.to(self.device)
-    self.unet.to(self.device)
-    self.generator = torch.manual_seed(0)    # Seed generator to create the inital latent noise
+  def __init__(self):
+    self.base = DiffusionPipeline.from_pretrained("stabilityai/sdxl-turbo", torch_dtype=torch.float16, variant="fp16", safety_checker=None, requires_safety_checker=False).to("cuda")
+    self.base.vae = AutoencoderTiny.from_pretrained('madebyollin/taesdxl', torch_device='cuda', torch_dtype=torch.float16)
+    self.base.vae = self.base.vae.cuda()
 
-  def generateLatents(self, height=512, width=512):
-    latents = torch.randn(
-        (1, self.unet.in_channels, height // 8, width // 8),
-        generator=self.generator,
+    config = CompilationConfig.Default()
+    config.enable_xformers = True
+    # config.enable_triton = True
+    config.enable_cuda_graph = True
+    config.enable_jit = True
+    config.enable_jit_freeze = True
+    config.trace_scheduler = False
+    config.enable_cnn_optimization = True
+    config.preserve_parameters = False
+    config.prefer_lowp_gemm = True
+
+    self.base = compile(self.base, config)
+    self.base.set_progress_bar_config(disable=True)
+    self.compel = Compel(
+      tokenizer=[self.base.tokenizer, self.base.tokenizer_2],
+      text_encoder=[self.base.text_encoder, self.base.text_encoder_2],
+      returned_embeddings_type=ReturnedEmbeddingsType.PENULTIMATE_HIDDEN_STATES_NON_NORMALIZED,
+      requires_pooled=[False, True]
     )
-    latents = latents.to(self.device)
-    return latents * self.scheduler.init_noise_sigma
 
-  def runSteps(self, latents, embedding, steps=20, cfg=7.5):
-    self.scheduler.set_timesteps(steps)
+  def weightedEmbeds(self, prompt, weight):
+    prompt_embeds, pooled_prompt_embeds = self.compel([prompt])
+    print("compel")
+    print(prompt_embeds)
+    print(pooled_prompt_embeds)
+    print(pooled_prompt_embeds.shape)
 
-    for t in tqdm(self.scheduler.timesteps):
-        print(f'step {t}')
-        # expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
-        latent_model_input = torch.cat([latents] * 2)
+    return (prompt_embeds * weight, pooled_prompt_embeds * weight)
+  
+  def customEmbedding(self, prompt, weight):
+    # tokens = self.base.tokenizer(prompt, return_tensors="pt", truncation=True, padding="longest").to("cuda")
+    # prompt_embeds = self.base.text_encoder(
+    #     **tokens, output_hidden_states=True
+    # )
+    # # create pooled prompt embeds
+    # pooled_prompt_embeds = prompt_embeds.hidden_states[-1].mean(1)
+    # # multiply by weight
 
-        latent_model_input = self.scheduler.scale_model_input(latent_model_input, timestep=t)
+    # # pooled_prompt_embeds = prompt_embeds[0]
 
-        # predict the noise residual
-        with torch.no_grad():
-            noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=embedding).sample
+    # prompt_embeds = prompt_embeds.hidden_states[-2]  # always penultimate layer
 
-        # perform guidance
-        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-        noise_pred = noise_pred_uncond + cfg * (noise_pred_text - noise_pred_uncond)
+    response = self.base.encode_prompt(prompt)
+    print(response)
+    prompt_embeds = response[0]
+    pooled_prompt_embeds = response[2]
 
-        # compute the previous noisy sample x_t -> x_t-1
-        latents = self.scheduler.step(noise_pred, t, latents).prev_sample
+    print("custom")
+    print(prompt_embeds)
+    print(pooled_prompt_embeds)
+    print(pooled_prompt_embeds.shape)
 
-    return latents
+    # bs_embed, seq_len, _ = prompt_embeds.shape
+    # prompt_embeds = prompt_embeds.repeat(1, 1, 1)
+    # prompt_embeds = prompt_embeds.view(bs_embed, seq_len, -1)
 
-  def getTextEmbedding(self, prompt):
-    text_input = self.tokenizer(prompt, padding="max_length", max_length=self.tokenizer.model_max_length, truncation=True, return_tensors="pt")
-    text_embeddings = self.text_encoder(text_input.input_ids.to(self.device))[0]
-    return text_embeddings
+    return (prompt_embeds * weight, pooled_prompt_embeds * weight)
 
-  def getUnconditionedEmbedding(self, max_length):
-    uncond_input = self.tokenizer(
-        [""], padding="max_length", max_length=max_length, return_tensors="pt"
-    )
-    uncond_embeddings = self.text_encoder(uncond_input.input_ids.to(self.device))[0]  
-    return uncond_embeddings
-
+    # tokens = self.base.tokenizer(prompt, return_tensors="pt", truncation=True, padding="longest").to("cuda")
+    # encoded = self.base.text_encoder(**tokens)
+    # print(encoded)
+    
+    # return (hidden_states * weight, pooled_hidden_states * weight)
+  
   # inputs is list of tuples (prompt, weight)
-  def generateFromWeightedTextEmbeddings(self, inputs, neg_prompt="", steps=20, cfg=7.5, seed=None):
-    if seed is not None:
-      self.generator.manual_seed(seed)
-    c_embedding = torch.stack([self.getTextEmbedding(prompt) * weight for (prompt, weight) in inputs]).sum(0)
-    u_embedding = self.getTextEmbedding(neg_prompt)
-    text_embeddings = torch.cat([u_embedding, c_embedding])
-    latents = self.generateLatents()
-    latents = self.runSteps(latents, text_embeddings, steps=steps, cfg=cfg)
-    latents = 1 / 0.18215 * latents
-    image = self.vae.decode(latents).sample
-    # create PIL image
-    image = (image / 2 + 0.5).clamp(0, 1)
-    image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
-    images = (image * 255).round().astype("uint8")
-    pil_images = [Image.fromarray(image) for image in images]
-    return pil_images[0]
+  def generateFromWeightedTextEmbeddings(self, inputs, neg_prompt="", steps=1, cfg=0, size=512, seed=None):
 
-  def generate(self, prompt, neg_prompt="", steps=20, cfg=7.5, seed=None):
-    if seed is not None:
-      self.generator.manual_seed(seed)
-    c_embedding = self.getTextEmbedding(prompt)
-    u_embedding = self.getTextEmbedding(neg_prompt)
-    text_embeddings = torch.cat([u_embedding, c_embedding])
-    latents = self.generateLatents()
-    latents = self.runSteps(latents, text_embeddings, steps=steps, cfg=cfg)
-    latents = 1 / 0.18215 * latents
-    image = self.vae.decode(latents).sample
-    # create PIL image
-    image = (image / 2 + 0.5).clamp(0, 1)
-    image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
-    images = (image * 255).round().astype("uint8")
-    pil_images = [Image.fromarray(image) for image in images]
-    return pil_images[0]
+    text_embeddings = [self.customEmbedding(p, w) for (p, w) in inputs]
+    prompt_embeddings = torch.stack([t[0] for t in text_embeddings]).sum(0)
+    pooled_prompt_embeddings = torch.stack([t[1] for t in text_embeddings]).sum(0)
+
+    return self.base(prompt_embeds=prompt_embeddings, pooled_prompt_embeds=pooled_prompt_embeddings, num_inference_steps=steps, guidance_scale=cfg, width=size, height=size, output_type="pil", generator=torch.Generator(device="cuda").manual_seed(seed), return_dict=False)[0][0]
+
+  def generateFromWeightedTextEmbeddingsDebug(self, inputs, neg_prompt="", steps=1, cfg=0, size=512, seed=None):
+    # if seed is not None:
+    #   self.generator = torch.Generator(device="cuda").manual_seed(seed)
+
+    # text_embeddings = [self.weightedEmbeds(p, w) for (p, w) in inputs]
+    start = time.time()
+    text_embeddings = [self.customEmbedding(p, w) for (p, w) in inputs]
+    text_embeddings_time = time.time() - start
+    start = time.time()
+    prompt_embeddings = torch.stack([t[0] for t in text_embeddings]).sum(0)
+    prompt_embeddings_time = time.time() - start
+    pooled_prompt_embeddings = torch.stack([t[1] for t in text_embeddings]).sum(0)
+    start = time.time()
+    pooled_prompt_embeddings_time = time.time() - start
+    start = time.time()
+    image = self.base(prompt_embeds=prompt_embeddings, pooled_prompt_embeds=pooled_prompt_embeddings, num_inference_steps=steps, guidance_scale=cfg, width=size, height=size, output_type="pil", generator=torch.Generator(device="cuda").manual_seed(seed), return_dict=False)[0][0]
+    image_time = time.time() - start
+
+    times = {
+      'text_embeddings': text_embeddings_time,
+      'prompt_embeddings': prompt_embeddings_time,
+      'pooled_prompt_embeddings': pooled_prompt_embeddings_time,
+      'image': image_time
+    }
+
+    return image, times
+
+
+
+  def generate(self, prompt, steps=1, cfg=0, size=512, seed=None):
+    # if seed is not None:
+    #   self.generator = torch.Generator(device="cuda").manual_seed(seed)
+    
+    prompt_embeds, pooled_prompt_embeds = self.compel([prompt])
+    return self.base(prompt_embeds=prompt_embeds, pooled_prompt_embeds=pooled_prompt_embeds, num_inference_steps=steps, guidance_scale=cfg, width=size, height=size, output_type="pil",generator=torch.Generator(device="cuda").manual_seed(seed), return_dict=False)[0][0]
+
+
+  # def generate(self, prompt, neg_prompt="", steps=20, cfg=7.5, seed=None):
+  #   if seed is not None:
+  #     self.generator.manual_seed(seed)
+  #   c_embedding = self.getTextEmbedding(prompt)
+  #   u_embedding = self.getTextEmbedding(neg_prompt)
+  #   text_embeddings = torch.cat([u_embedding, c_embedding])
+  #   latents = self.generateLatents()
+  #   latents = self.runSteps(latents, text_embeddings, steps=steps, cfg=cfg)
+  #   latents = 1 / 0.18215 * latents
+  #   image = self.vae.decode(latents).sample
+  #   # create PIL image
+  #   image = (image / 2 + 0.5).clamp(0, 1)
+  #   image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
+  #   images = (image * 255).round().astype("uint8")
+  #   pil_images = [Image.fromarray(image) for image in images]
+  #   return pil_images[0]
